@@ -42,6 +42,9 @@ help:
 	@echo "  create-schedule   Create a new vesting schedule"
 	@echo "  claim             Claim vested tokens for a schedule"
 	@echo "  revoke            Revoke a vesting schedule"
+	@echo "  api-install       Install API server dependencies"
+	@echo "  api-dev           Run the API server in watch mode"
+	@echo "  api-build         Type-check and build the API server"
 	@echo ""
 	@echo "Variables:"
 	@echo "  NETWORK       Network (testnet/mainnet, default: testnet)"
@@ -166,3 +169,16 @@ revoke:
 		-- \
 		revoke \
 		--schedule-id $(SCHEDULE_ID)
+
+# ── API server ───────────────────────────────────────────────────────────────
+.PHONY: api-install
+api-install:
+	npm --prefix api install
+
+.PHONY: api-dev
+api-dev:
+	npm --prefix api run dev
+
+.PHONY: api-build
+api-build:
+	npm --prefix api run build
