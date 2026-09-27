@@ -758,9 +758,9 @@ export async function batchGive(
   );
   return buildAndSend(publicKey, "batch_give", [
     nativeToScVal(publicKey, { type: "address" }),
+    nativeToScVal(token, { type: "address" }),
     receiversScVal,
     amountsScVal,
-    nativeToScVal(token, { type: "address" }),
   ]);
 }
 

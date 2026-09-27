@@ -111,6 +111,12 @@ pub enum VestFlowError {
     /// `update_stream_rate` was called for a (funder, token) pair that has no
     /// stream configuration.
     StreamsNotConfigured = 37,
+    /// Receiver already exists in splits configuration.
+    AlreadyExists = 38,
+    /// Stream end_time is at or before the current ledger timestamp.
+    EndTimeInPast = 39,
+    /// Array arguments have mismatched lengths.
+    LengthMismatch = 40,
 }
 
 #[contracttype]
@@ -158,6 +164,8 @@ pub enum DataKey {
     Splits(Address),
     /// Token-specific streams configuration + accounting: (funder, token).
     AccountTokenStreams(Address, Address),
+    /// Fixed end timestamp for a (funder, token) stream.
+    StreamEndTime(Address, Address),
     /// Tokens a receiver has accrued from streams but not yet collected: (receiver, token).
     Accrued(Address, Address),
     /// Index of (list_id, member) streams opened by a (funder, token).
@@ -338,6 +346,15 @@ pub struct DripsStream {
     /// While paused the effective drip rate is 0 and the funder's streaming
     /// balance stops depleting; the receiver configuration is preserved.
     pub paused_at: u64,
+}
+
+/// One historical or preview entry for a sender's streams configuration.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamsHistory {
+    pub receivers: Vec<StreamReceiver>,
+    pub update_time: u64,
+    pub max_end: u64,
 }
 
 /// A proportional split receiver that routes its share to a fixed address.
@@ -3727,33 +3744,57 @@ impl VestFlowContract {
     }
 
     /// Transfer one-time token gifts to multiple receivers atomically.
+    ///
+    /// The total sum of `amounts` is pulled from `sender` in a single SAC call,
+    /// then transferred to each receiver, emitting one `given` event per receiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LengthMismatch` if `receivers` and `amounts` have different lengths.
+    /// Returns `AmountZero` if any amount is zero or negative.
     pub fn batch_give(
         env: Env,
         sender: Address,
+        token: Address,
         receivers: Vec<Address>,
         amounts: Vec<i128>,
-        token: Address,
-    ) {
+    ) -> Result<(), VestFlowError> {
         sender.require_auth();
-        assert!(
-            receivers.len() == amounts.len(),
-            "Receivers and amounts length mismatch"
-        );
-        assert!(!receivers.is_empty(), "Receivers must not be empty");
+        if receivers.len() != amounts.len() {
+            return Err(VestFlowError::LengthMismatch);
+        }
+        if receivers.is_empty() {
+            return Ok(());
+        }
+
+        let mut total_amount: i128 = 0;
+        for amount in amounts.iter() {
+            if amount <= 0 {
+                return Err(VestFlowError::AmountZero);
+            }
+            total_amount = total_amount
+                .checked_add(amount)
+                .expect("Total amount overflow");
+        }
 
         let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+
         for i in 0..receivers.len() {
             let receiver = receivers.get(i).expect("i < len");
             let amount = amounts.get(i).expect("i < len");
-            assert!(amount > 0, "Give amount must be positive");
-            token_client.transfer(&sender, &receiver, &amount);
+            token_client.transfer(&env.current_contract_address(), &receiver, &amount);
         }
+
         for i in 0..receivers.len() {
+            let amount = amounts.get(i).expect("i < len");
             env.events().publish(
                 (symbol_short!("given"), sender.clone(), token.clone()),
-                amounts.get(i).expect("i < len"),
+                amount,
             );
         }
+
+        Ok(())
     }
 
     /// Stream funds to all members of a drips list equally.
@@ -3960,8 +4001,8 @@ impl VestFlowContract {
             .storage()
             .instance()
             .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(
-                account,
-                token,
+                account.clone(),
+                token.clone(),
             )) {
             Some(c) => c,
             None => return 0,
@@ -3982,7 +4023,16 @@ impl VestFlowContract {
         }
 
         let now = env.ledger().timestamp();
-        let elapsed: i128 = now.saturating_sub(config.last_update) as i128;
+        let end_time: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamEndTime(account, token));
+        let effective_now = match end_time {
+            Some(et) if et > 0 => now.min(et),
+            _ => now,
+        };
+
+        let elapsed: i128 = effective_now.saturating_sub(config.last_update) as i128;
         if elapsed <= 0 {
             return config.balance;
         }
@@ -4148,14 +4198,25 @@ impl VestFlowContract {
             }
         }
 
-        if let Some(config) = env
+        let end_time: Option<u64> = env
             .storage()
             .instance()
-            .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(sender, token))
-        {
-            for r in config.receivers.iter() {
-                if r.receiver == receiver && r.amt_per_sec > 0 {
-                    rate = rate.saturating_add(r.amt_per_sec);
+            .get(&DataKey::StreamEndTime(sender.clone(), token.clone()));
+        let stream_ended = match end_time {
+            Some(et) if et > 0 => env.ledger().timestamp() >= et,
+            _ => false,
+        };
+
+        if !stream_ended {
+            if let Some(config) = env
+                .storage()
+                .instance()
+                .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(sender, token))
+            {
+                for r in config.receivers.iter() {
+                    if r.receiver == receiver && r.amt_per_sec > 0 {
+                        rate = rate.saturating_add(r.amt_per_sec);
+                    }
                 }
             }
         }
@@ -4278,6 +4339,9 @@ impl VestFlowContract {
             &DataKey::AccountTokenStreams(funder.clone(), token.clone()),
             &config,
         );
+        env.storage().instance().remove(
+            &DataKey::StreamEndTime(funder.clone(), token.clone()),
+        );
         env.storage().instance().extend_ttl(
             INSTANCE_TTL_THRESHOLD_LEDGERS,
             INSTANCE_TTL_EXTEND_TO_LEDGERS,
@@ -4286,6 +4350,92 @@ impl VestFlowContract {
             (symbol_short!("strm_set"), funder, token),
             env.ledger().timestamp(),
         );
+    }
+
+    /// Open or update a token-specific stream configuration with a fixed end time.
+    ///
+    /// The stream rate automatically drops to 0 after `end_time` without requiring
+    /// the sender to submit another transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EndTimeInPast` if `end_time <= now`.
+    pub fn set_stream_with_end_time(
+        env: Env,
+        sender: Address,
+        token: Address,
+        receivers: Vec<StreamReceiver>,
+        balance: i128,
+        end_time: u64,
+    ) -> Result<(), VestFlowError> {
+        sender.require_auth();
+        let now = env.ledger().timestamp();
+        if end_time <= now {
+            return Err(VestFlowError::EndTimeInPast);
+        }
+        assert!(
+            !receivers.is_empty(),
+            "At least one stream receiver required"
+        );
+        assert!(balance >= 0, "Top-up must be non-negative");
+
+        for receiver in receivers.iter() {
+            receiver.validate().expect("Invalid stream receiver rate");
+        }
+
+        if balance > 0 {
+            token::Client::new(&env, &token).transfer(
+                &sender,
+                &env.current_contract_address(),
+                &balance,
+            );
+            let balance_key = DataKey::StreamBalance(sender.clone(), token.clone());
+            let funded: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+            env.storage().instance().set(
+                &balance_key,
+                &funded.checked_add(balance).expect("Stream balance overflow"),
+            );
+        }
+
+        let previous: Option<AccountTokenStreams> = env
+            .storage()
+            .instance()
+            .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(
+                sender.clone(),
+                token.clone(),
+            ));
+        let new_balance = previous
+            .map(|config| config.balance)
+            .unwrap_or(0)
+            .checked_add(balance)
+            .expect("Stream balance overflow");
+
+        let config = AccountTokenStreams {
+            funder: sender.clone(),
+            token: token.clone(),
+            receivers,
+            balance: new_balance,
+            start_time: now,
+            last_update: now,
+        };
+        env.storage().instance().set(
+            &DataKey::AccountTokenStreams(sender.clone(), token.clone()),
+            &config,
+        );
+        env.storage().instance().set(
+            &DataKey::StreamEndTime(sender.clone(), token.clone()),
+            &end_time,
+        );
+        env.storage().instance().extend_ttl(
+            INSTANCE_TTL_THRESHOLD_LEDGERS,
+            INSTANCE_TTL_EXTEND_TO_LEDGERS,
+        );
+        env.events().publish(
+            (symbol_short!("strm_set"), sender, token),
+            now,
+        );
+
+        Ok(())
     }
 
     /// Change the drip rate of a single receiver in `sender`'s stream
@@ -4413,8 +4563,17 @@ impl VestFlowContract {
             .expect("Streams not configured");
 
         let now = env.ledger().timestamp();
-        let elapsed: i128 = now.saturating_sub(config.last_update) as i128;
-        if elapsed == 0 || config.balance == 0 || receivers.is_empty() {
+        let end_time: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamEndTime(funder.clone(), token.clone()));
+        let effective_now = match end_time {
+            Some(et) if et > 0 => now.min(et),
+            _ => now,
+        };
+
+        let elapsed: i128 = effective_now.saturating_sub(config.last_update) as i128;
+        if elapsed <= 0 || config.balance == 0 || receivers.is_empty() {
             return 0;
         }
 
@@ -4428,7 +4587,7 @@ impl VestFlowContract {
             .expect("Stream settlement overflow");
         let capped: i128 = gross.min(max).min(config.balance);
 
-        config.last_update = env.ledger().timestamp();
+        config.last_update = effective_now;
         config.balance = config
             .balance
             .checked_sub(capped)
@@ -4506,6 +4665,149 @@ impl VestFlowContract {
             .publish((symbol_short!("strm_col"), account, token), transfer_amount);
 
         transfer_amount
+    }
+
+    /// Collect available stream balances across multiple tokens in a single call.
+    ///
+    /// Skips tokens with zero available balance without performing a token transfer.
+    /// Returns a parallel vector with the collected amount per token.
+    pub fn collect_all(env: Env, account: Address, tokens: Vec<Address>) -> Vec<i128> {
+        account.require_auth();
+        let mut results: Vec<i128> = Vec::new(&env);
+        for token in tokens.iter() {
+            let key = DataKey::Accrued(account.clone(), token.clone());
+            let accrued: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            if accrued > 0 {
+                token::Client::new(&env, &token).transfer(
+                    &env.current_contract_address(),
+                    &account,
+                    &accrued,
+                );
+                env.storage().instance().set(&key, &0_i128);
+                env.storage().instance().extend_ttl(
+                    INSTANCE_TTL_THRESHOLD_LEDGERS,
+                    INSTANCE_TTL_EXTEND_TO_LEDGERS,
+                );
+                env.events()
+                    .publish((symbol_short!("strm_col"), account.clone(), token), accrued);
+                results.push_back(accrued);
+            } else {
+                results.push_back(0);
+            }
+        }
+        results
+    }
+
+    /// Read-only simulation view that returns how much a receiver would collect
+    /// from `squeeze_streams` without submitting a transaction.
+    ///
+    /// Returns 0 when nothing is squeezable. Does not modify state.
+    pub fn squeeze_streams_result(
+        env: Env,
+        receiver: Address,
+        token: Address,
+        sender: Address,
+        history: Vec<StreamsHistory>,
+    ) -> i128 {
+        let now = env.ledger().timestamp();
+        let mut total_squeezable: i128 = 0;
+
+        if !history.is_empty() {
+            for entry in history.iter() {
+                for r in entry.receivers.iter() {
+                    if r.receiver == receiver && r.amt_per_sec > 0 {
+                        let start = entry.update_time;
+                        let end = now.min(entry.max_end);
+                        if end > start {
+                            let elapsed = (end - start) as i128;
+                            let amount = elapsed.saturating_mul(r.amt_per_sec);
+                            total_squeezable = total_squeezable.saturating_add(amount);
+                        }
+                    }
+                }
+            }
+        } else if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(
+                sender.clone(),
+                token.clone(),
+            ))
+        {
+            let end_time: Option<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::StreamEndTime(sender.clone(), token.clone()));
+            let effective_now = match end_time {
+                Some(et) if et > 0 => now.min(et),
+                _ => now,
+            };
+            let elapsed: i128 = effective_now.saturating_sub(config.last_update) as i128;
+            if elapsed > 0 && config.balance > 0 {
+                for r in config.receivers.iter() {
+                    if r.receiver == receiver && r.amt_per_sec > 0 {
+                        let amount = elapsed.saturating_mul(r.amt_per_sec);
+                        total_squeezable = total_squeezable.saturating_add(amount);
+                    }
+                }
+            }
+        }
+
+        let balance = Self::stream_balance(env, sender, token);
+        total_squeezable.min(balance).max(0)
+    }
+
+    /// Collect tokens dripped so far in an unfinished cycle ("squeeze").
+    pub fn squeeze_streams(
+        env: Env,
+        receiver: Address,
+        sender: Address,
+        token: Address,
+        history: Vec<StreamsHistory>,
+    ) -> i128 {
+        receiver.require_auth();
+        let amount = Self::squeeze_streams_result(
+            env.clone(),
+            receiver.clone(),
+            token.clone(),
+            sender.clone(),
+            history,
+        );
+
+        if amount > 0 {
+            let key = DataKey::AccountTokenStreams(sender.clone(), token.clone());
+            if let Some(mut config) = env
+                .storage()
+                .instance()
+                .get::<DataKey, AccountTokenStreams>(&key)
+            {
+                config.balance = config.balance.saturating_sub(amount);
+                config.last_update = env.ledger().timestamp();
+                env.storage().instance().set(&key, &config);
+            }
+            let bal_key = DataKey::StreamBalance(sender.clone(), token.clone());
+            let funded: i128 = env.storage().instance().get(&bal_key).unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&bal_key, &funded.saturating_sub(amount));
+
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &receiver,
+                &amount,
+            );
+
+            env.events().publish(
+                (symbol_short!("squeezed"), receiver, sender, token),
+                amount,
+            );
+            env.storage().instance().extend_ttl(
+                INSTANCE_TTL_THRESHOLD_LEDGERS,
+                INSTANCE_TTL_EXTEND_TO_LEDGERS,
+            );
+        }
+
+        amount
     }
 
     /// Pause all outgoing streams of `account` for `token`.
@@ -9538,7 +9840,7 @@ mod test {
         }
 
         let sender_before = token.balance(&sender);
-        client.batch_give(&sender, &receivers, &amounts, &token_address);
+        client.batch_give(&sender, &token_address, &receivers, &amounts);
 
         let events = env.events().all();
         let given_events = events.iter().filter(|(_, topics, data)| {
@@ -11878,5 +12180,407 @@ mod test {
             client.stream_rate_for(&funder, &receiver, &token_address),
             10
         );
+    }
+
+    #[test]
+    fn test_collect_all_single_and_multiple_tokens_and_all_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, receiver, token_a, token_admin) = setup(&env);
+        let token_b = create_token_contract(&env, &token_admin);
+        let token_c = create_token_contract(&env, &token_admin);
+
+        StellarAssetClient::new(&env, &token_a).mint(&funder, &100_000);
+        StellarAssetClient::new(&env, &token_b).mint(&funder, &100_000);
+
+        set_time(&env, 1_000);
+        client.set_stream(
+            &funder,
+            &token_a,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &10_000,
+        );
+        client.set_stream(
+            &funder,
+            &token_b,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 20,
+                },
+            ],
+            &20_000,
+        );
+
+        set_time(&env, 1_100);
+        client.receive_streams(
+            &funder,
+            &token_a,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &i128::MAX,
+        );
+        client.receive_streams(
+            &funder,
+            &token_b,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 20,
+                },
+            ],
+            &i128::MAX,
+        );
+
+        // Test 1: Single token collection
+        let collected_single = client.collect_all(&receiver, &vec![&env, token_a.clone()]);
+        assert_eq!(collected_single, vec![&env, 1_000]);
+        assert_eq!(TokenClient::new(&env, &token_a).balance(&receiver), 1_000);
+
+        // Advance time by another 100 seconds
+        set_time(&env, 1_200);
+        client.receive_streams(
+            &funder,
+            &token_a,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &i128::MAX,
+        );
+
+        // Test 2: Multiple tokens collection
+        let collected_multi = client.collect_all(
+            &receiver,
+            &vec![&env, token_a.clone(), token_b.clone(), token_c.clone()],
+        );
+        assert_eq!(collected_multi, vec![&env, 1_000, 2_000, 0]);
+        assert_eq!(TokenClient::new(&env, &token_a).balance(&receiver), 2_000);
+        assert_eq!(TokenClient::new(&env, &token_b).balance(&receiver), 2_000);
+        assert_eq!(TokenClient::new(&env, &token_c).balance(&receiver), 0);
+
+        // Test 3: All zero balances (skips SAC transfer)
+        let collected_zeros = client.collect_all(
+            &receiver,
+            &vec![&env, token_a.clone(), token_b.clone(), token_c.clone()],
+        );
+        assert_eq!(collected_zeros, vec![&env, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_set_stream_with_end_time_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, receiver, token_address, _) = setup(&env);
+        StellarAssetClient::new(&env, &token_address).mint(&funder, &100_000);
+
+        set_time(&env, 1_000);
+
+        // 1. Past end_time rejected
+        let past_res = client.try_set_stream_with_end_time(
+            &funder,
+            &token_address,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &10_000,
+            &1_000,
+        );
+        assert_eq!(past_res, Err(Ok(VestFlowError::EndTimeInPast)));
+
+        let past_res_before = client.try_set_stream_with_end_time(
+            &funder,
+            &token_address,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &10_000,
+            &999,
+        );
+        assert_eq!(past_res_before, Err(Ok(VestFlowError::EndTimeInPast)));
+
+        // 2. Set stream with end_time = 1_500 (duration = 500s)
+        let res = client.try_set_stream_with_end_time(
+            &funder,
+            &token_address,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &10_000,
+            &1_500,
+        );
+        assert_eq!(res, Ok(Ok(())));
+
+        // Before end: at ts = 1_200 (elapsed = 200s)
+        set_time(&env, 1_200);
+        assert_eq!(
+            client.stream_rate_for(&funder, &receiver, &token_address),
+            10
+        );
+        assert!(client.is_stream_active(&funder, &receiver, &token_address));
+
+        let bal = client.get_stream_balance(
+            &funder,
+            &token_address,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+        );
+        assert_eq!(bal, 8_000);
+
+        // Reaches end and past end: at ts = 2_000 (> 1_500)
+        set_time(&env, 2_000);
+        assert_eq!(
+            client.stream_rate_for(&funder, &receiver, &token_address),
+            0
+        );
+        assert!(!client.is_stream_active(&funder, &receiver, &token_address));
+
+        let bal_past = client.get_stream_balance(
+            &funder,
+            &token_address,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+        );
+        assert_eq!(bal_past, 5_000);
+
+        let settled = client.receive_streams(
+            &funder,
+            &token_address,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &i128::MAX,
+        );
+        assert_eq!(settled, 5_000);
+
+        set_time(&env, 2_500);
+        let settled_subsequent = client.receive_streams(
+            &funder,
+            &token_address,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &i128::MAX,
+        );
+        assert_eq!(settled_subsequent, 0);
+    }
+
+    #[test]
+    fn test_batch_give_rejected_cases() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, receiver1, token_address, _) = setup(&env);
+        let receiver2 = Address::generate(&env);
+
+        // 1. Length mismatch rejected
+        let mismatch_res = client.try_batch_give(
+            &sender,
+            &token_address,
+            &vec![&env, receiver1.clone(), receiver2.clone()],
+            &vec![&env, 100],
+        );
+        assert_eq!(mismatch_res, Err(Ok(VestFlowError::LengthMismatch)));
+
+        // 2. Zero amount rejected
+        let zero_res = client.try_batch_give(
+            &sender,
+            &token_address,
+            &vec![&env, receiver1.clone(), receiver2.clone()],
+            &vec![&env, 100, 0],
+        );
+        assert_eq!(zero_res, Err(Ok(VestFlowError::AmountZero)));
+
+        let neg_res = client.try_batch_give(
+            &sender,
+            &token_address,
+            &vec![&env, receiver1.clone(), receiver2.clone()],
+            &vec![&env, -5, 100],
+        );
+        assert_eq!(neg_res, Err(Ok(VestFlowError::AmountZero)));
+    }
+
+    #[test]
+    fn test_batch_give_two_receivers_and_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, receiver1, token_address, _) = setup(&env);
+        let receiver2 = Address::generate(&env);
+        let token = TokenClient::new(&env, &token_address);
+        StellarAssetClient::new(&env, &token_address).mint(&sender, &50_000);
+
+        let sender_before = token.balance(&sender);
+        let r1_before = token.balance(&receiver1);
+        let r2_before = token.balance(&receiver2);
+
+        client.batch_give(
+            &sender,
+            &token_address,
+            &vec![&env, receiver1.clone(), receiver2.clone()],
+            &vec![&env, 500_i128, 1_500_i128],
+        );
+
+        let events = env.events().all();
+        let given_events = events.iter().filter(|(_, topics, data)| {
+            if let Some(t0) = topics.get(0) {
+                let event: Result<soroban_sdk::Symbol, _> = t0.try_into_val(&env);
+                let event_data: Result<i128, _> = data.try_into_val(&env);
+                match (event, event_data) {
+                    (Ok(s), Ok(amt)) => s == symbol_short!("given") && (amt == 500 || amt == 1_500),
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        });
+        assert_eq!(given_events.count(), 2);
+
+        assert_eq!(token.balance(&sender), sender_before - 2_000);
+        assert_eq!(token.balance(&receiver1), r1_before + 500);
+        assert_eq!(token.balance(&receiver2), r2_before + 1_500);
+    }
+
+    #[test]
+    fn test_squeeze_streams_result_and_squeeze_streams() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, receiver, token_address, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_address);
+        StellarAssetClient::new(&env, &token_address).mint(&funder, &100_000);
+
+        set_time(&env, 1_000);
+
+        // 1. Zero case when no stream configured
+        let zero_res = client.squeeze_streams_result(
+            &receiver,
+            &token_address,
+            &funder,
+            &vec![&env],
+        );
+        assert_eq!(zero_res, 0);
+
+        // Set stream with 10 tokens / sec
+        client.set_stream(
+            &funder,
+            &token_address,
+            &vec![
+                &env,
+                StreamReceiver {
+                    receiver: receiver.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &20_000,
+        );
+
+        // 2. Advance time 200s (200 * 10 = 2000 stroops)
+        set_time(&env, 1_200);
+
+        // Preview squeeze amount
+        let preview = client.squeeze_streams_result(
+            &receiver,
+            &token_address,
+            &funder,
+            &vec![&env],
+        );
+        assert_eq!(preview, 2_000);
+
+        // Calling view multiple times does not modify state
+        let preview_again = client.squeeze_streams_result(
+            &receiver,
+            &token_address,
+            &funder,
+            &vec![&env],
+        );
+        assert_eq!(preview_again, 2_000);
+        assert_eq!(token.balance(&receiver), 0);
+
+        // Test with history structure
+        let history = vec![
+            &env,
+            StreamsHistory {
+                receivers: vec![
+                    &env,
+                    StreamReceiver {
+                        receiver: receiver.clone(),
+                        amt_per_sec: 10,
+                    },
+                ],
+                update_time: 1_000,
+                max_end: 3_000,
+            },
+        ];
+        let preview_with_history = client.squeeze_streams_result(
+            &receiver,
+            &token_address,
+            &funder,
+            &history,
+        );
+        assert_eq!(preview_with_history, 2_000);
+
+        // 3. Actual squeeze matches simulation view
+        let receiver_before = token.balance(&receiver);
+        let actual_squeezed = client.squeeze_streams(
+            &receiver,
+            &funder,
+            &token_address,
+            &vec![&env],
+        );
+        assert_eq!(actual_squeezed, preview);
+        assert_eq!(token.balance(&receiver), receiver_before + 2_000);
+
+        // After squeeze, preview for already squeezed period returns 0
+        let preview_after = client.squeeze_streams_result(
+            &receiver,
+            &token_address,
+            &funder,
+            &vec![&env],
+        );
+        assert_eq!(preview_after, 0);
     }
 }
