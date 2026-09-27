@@ -111,12 +111,12 @@ pub enum VestFlowError {
     /// `update_stream_rate` was called for a (funder, token) pair that has no
     /// stream configuration.
     StreamsNotConfigured = 37,
-    /// Receiver already exists in splits configuration.
+    /// Item or receiver already exists.
     AlreadyExists = 38,
+    /// Receivers and amounts vectors have different lengths.
+    LengthMismatch = 39,
     /// Stream end_time is at or before the current ledger timestamp.
-    EndTimeInPast = 39,
-    /// Array arguments have mismatched lengths.
-    LengthMismatch = 40,
+    EndTimeInPast = 40,
 }
 
 #[contracttype]
@@ -454,6 +454,23 @@ pub struct AccountTokenStreams {
     pub start_time: u64,
     /// Ledger timestamp accounting last settled to for this pair.
     pub last_update: u64,
+}
+
+/// Snapshot of an account's current outgoing stream configuration for one token (#601).
+///
+/// Returned by `streams_state`. `hash` is the SHA-256 of the XDR-encoded
+/// `Vec<StreamReceiver>` at the time of the last `set_stream` call, matching
+/// what `hash_streams` returns for the same list. All fields are zero when no
+/// stream has been configured for the (account, token) pair.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamsState {
+    /// SHA-256 hash of the current receivers list, or zero if unconfigured.
+    pub hash: BytesN<32>,
+    /// Ledger timestamp of the last `set_stream` call, or 0 if unconfigured.
+    pub last_update: u64,
+    /// Funded balance still available for streaming, or 0 if unconfigured.
+    pub balance: i128,
 }
 
 /// A contract WASM upgrade that has been announced on-chain but not yet executed.
@@ -3755,9 +3772,9 @@ impl VestFlowContract {
     pub fn batch_give(
         env: Env,
         sender: Address,
-        token: Address,
         receivers: Vec<Address>,
         amounts: Vec<i128>,
+        token: Address,
     ) -> Result<(), VestFlowError> {
         sender.require_auth();
         if receivers.len() != amounts.len() {
@@ -3767,27 +3784,19 @@ impl VestFlowContract {
             return Ok(());
         }
 
-        let mut total_amount: i128 = 0;
-        for amount in amounts.iter() {
+        // Validate all amounts are positive before transferring
+        for i in 0..amounts.len() {
+            let amount = amounts.get(i).expect("i < len");
             if amount <= 0 {
                 return Err(VestFlowError::AmountZero);
             }
-            total_amount = total_amount
-                .checked_add(amount)
-                .expect("Total amount overflow");
         }
 
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
-
         for i in 0..receivers.len() {
             let receiver = receivers.get(i).expect("i < len");
             let amount = amounts.get(i).expect("i < len");
-            token_client.transfer(&env.current_contract_address(), &receiver, &amount);
-        }
-
-        for i in 0..receivers.len() {
-            let amount = amounts.get(i).expect("i < len");
+            token_client.transfer(&sender, &receiver, &amount);
             env.events().publish(
                 (symbol_short!("given"), sender.clone(), token.clone()),
                 amount,
@@ -5153,6 +5162,100 @@ impl VestFlowContract {
     ///
     /// Panics with `"NFT contract not initialized"` when no NFT contract has
     /// been configured yet.
+    /// SHA-256 hash of `account`'s current splits configuration.
+    ///
+    /// Returns the zero hash (`[0u8; 32]`) when the account has no splits
+    /// configured. The hash is computed over the XDR encoding of the full
+    /// `Vec<SplitReceiver>` as stored, so it matches the hash returned by
+    /// `hash_splits` when passed the same list (#602).
+    pub fn splits_hash(env: Env, account: Address) -> BytesN<32> {
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        let receivers: Vec<SplitReceiver> = match env
+            .storage()
+            .instance()
+            .get(&DataKey::Splits(account))
+        {
+            Some(r) => r,
+            None => return zero,
+        };
+        if receivers.is_empty() {
+            return zero;
+        }
+        let encoded = receivers.to_xdr(&env);
+        env.crypto().sha256(&encoded).to_bytes()
+    }
+
+    /// Pure helper: SHA-256 hash of an arbitrary `receivers` list.
+    ///
+    /// Computes the same digest as `splits_hash` would store after a
+    /// `set_splits` call with the same list, allowing off-chain tooling to
+    /// predict or verify the on-chain hash without a contract call (#604).
+    ///
+    /// Returns the zero hash for an empty list.
+    pub fn hash_splits(env: Env, receivers: Vec<SplitReceiver>) -> BytesN<32> {
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if receivers.is_empty() {
+            return zero;
+        }
+        let encoded = receivers.to_xdr(&env);
+        env.crypto().sha256(&encoded).to_bytes()
+    }
+
+    /// Snapshot of `account`'s current outgoing stream configuration for `token` (#601).
+    ///
+    /// Returns a [`StreamsState`] containing:
+    /// - `hash` — SHA-256 of the XDR-encoded receivers list (matches `hash_streams` for the same list)
+    /// - `last_update` — ledger timestamp of the last `set_stream` call
+    /// - `balance` — funded tokens still available for streaming
+    ///
+    /// All fields are zero when no stream has been configured for this (account, token) pair.
+    pub fn streams_state(env: Env, account: Address, token: Address) -> StreamsState {
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let config: AccountTokenStreams = match env
+            .storage()
+            .instance()
+            .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(
+                account.clone(),
+                token.clone(),
+            )) {
+            Some(c) => c,
+            None => {
+                return StreamsState {
+                    hash: zero_hash,
+                    last_update: 0,
+                    balance: 0,
+                }
+            }
+        };
+        let hash = if config.receivers.is_empty() {
+            zero_hash
+        } else {
+            let encoded = config.receivers.to_xdr(&env);
+            env.crypto().sha256(&encoded).to_bytes()
+        };
+        StreamsState {
+            hash,
+            last_update: config.last_update,
+            balance: config.balance,
+        }
+    }
+
+    /// Pure helper: SHA-256 hash of an arbitrary `Vec<StreamReceiver>` list (#603).
+    ///
+    /// Computes the same digest as `streams_state` would store after a
+    /// `set_stream` call with the same list, enabling off-chain tooling to
+    /// predict or verify the on-chain hash without a contract call.
+    ///
+    /// Returns the zero hash for an empty list.
+    pub fn hash_streams(env: Env, receivers: Vec<StreamReceiver>) -> BytesN<32> {
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if receivers.is_empty() {
+            return zero;
+        }
+        let encoded = receivers.to_xdr(&env);
+        env.crypto().sha256(&encoded).to_bytes()
+    }
+
     pub fn nft_split(env: Env, token_id: u128, weight: u128) -> NftSplitsReceiver {
         let nft_contract = env
             .storage()
@@ -9840,7 +9943,7 @@ mod test {
         }
 
         let sender_before = token.balance(&sender);
-        client.batch_give(&sender, &token_address, &receivers, &amounts);
+        client.batch_give(&sender, &receivers, &amounts, &token_address);
 
         let events = env.events().all();
         let given_events = events.iter().filter(|(_, topics, data)| {
@@ -9854,6 +9957,71 @@ mod test {
         for receiver in receivers.iter() {
             assert_eq!(token.balance(&receiver), amount);
         }
+    }
+
+    #[test]
+    fn test_batch_give_two_receivers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_address);
+        let receiver1 = Address::generate(&env);
+        let receiver2 = Address::generate(&env);
+
+        let mut receivers = Vec::new(&env);
+        receivers.push_back(receiver1.clone());
+        receivers.push_back(receiver2.clone());
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+        amounts.push_back(250i128);
+
+        let sender_before = token.balance(&sender);
+        client.batch_give(&sender, &receivers, &amounts, &token_address);
+
+        let events = env.events().all();
+        let given_count = events.iter().filter(|(_, topics, _)| {
+            let event: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            event.is_ok() && event.unwrap() == symbol_short!("given")
+        }).count();
+        assert_eq!(given_count, 2);
+
+        assert_eq!(token.balance(&sender), sender_before - 350);
+        assert_eq!(token.balance(&receiver1), 100);
+        assert_eq!(token.balance(&receiver2), 250);
+    }
+
+    #[test]
+    fn test_batch_give_length_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let mut receivers = Vec::new(&env);
+        receivers.push_back(Address::generate(&env));
+        receivers.push_back(Address::generate(&env));
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+
+        let res = client.try_batch_give(&sender, &receivers, &amounts, &token_address);
+        assert_eq!(res, Err(Ok(VestFlowError::LengthMismatch)));
+    }
+
+    #[test]
+    fn test_batch_give_zero_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let mut receivers = Vec::new(&env);
+        receivers.push_back(Address::generate(&env));
+        receivers.push_back(Address::generate(&env));
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+        amounts.push_back(0i128);
+
+        let res = client.try_batch_give(&sender, &receivers, &amounts, &token_address);
+        assert_eq!(res, Err(Ok(VestFlowError::AmountZero)));
     }
 
     #[test]
@@ -12173,7 +12341,6 @@ mod test {
             ],
             &100_000,
         );
-
         let result = client.try_update_stream_rate(&funder, &token_address, &receiver, &-1);
         assert_eq!(result, Err(Ok(VestFlowError::WeightZero)));
         assert_eq!(
@@ -12421,26 +12588,26 @@ mod test {
         // 1. Length mismatch rejected
         let mismatch_res = client.try_batch_give(
             &sender,
-            &token_address,
             &vec![&env, receiver1.clone(), receiver2.clone()],
             &vec![&env, 100],
+            &token_address,
         );
         assert_eq!(mismatch_res, Err(Ok(VestFlowError::LengthMismatch)));
 
         // 2. Zero amount rejected
         let zero_res = client.try_batch_give(
             &sender,
-            &token_address,
             &vec![&env, receiver1.clone(), receiver2.clone()],
             &vec![&env, 100, 0],
+            &token_address,
         );
         assert_eq!(zero_res, Err(Ok(VestFlowError::AmountZero)));
 
         let neg_res = client.try_batch_give(
             &sender,
-            &token_address,
             &vec![&env, receiver1.clone(), receiver2.clone()],
             &vec![&env, -5, 100],
+            &token_address,
         );
         assert_eq!(neg_res, Err(Ok(VestFlowError::AmountZero)));
     }
@@ -12460,9 +12627,9 @@ mod test {
 
         client.batch_give(
             &sender,
-            &token_address,
             &vec![&env, receiver1.clone(), receiver2.clone()],
             &vec![&env, 500_i128, 1_500_i128],
+            &token_address,
         );
 
         let events = env.events().all();
@@ -12582,5 +12749,149 @@ mod test {
             &vec![&env],
         );
         assert_eq!(preview_after, 0);
+    }
+
+    // ── #603 hash_streams ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hash_streams_empty_list_returns_zero_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+
+        let result = client.hash_streams(&soroban_sdk::vec![&env]);
+        assert_eq!(result, BytesN::from_array(&env, &[0u8; 32]));
+    }
+
+    #[test]
+    fn test_hash_streams_single_receiver_non_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let receiver = Address::generate(&env);
+
+        let receivers = soroban_sdk::vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: 10,
+            },
+        ];
+        let hash = client.hash_streams(&receivers);
+        assert_ne!(hash, BytesN::from_array(&env, &[0u8; 32]));
+    }
+
+    #[test]
+    fn test_hash_streams_matches_streams_state_hash_after_set_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, receiver, token_address, _) = setup(&env);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &50_000);
+
+        set_time(&env, 1_000);
+        let receivers = soroban_sdk::vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: 5,
+            },
+        ];
+        client.set_stream(&funder, &token_address, &receivers, &50_000);
+
+        let expected_hash = client.hash_streams(&receivers);
+        let state = client.streams_state(&funder, &token_address);
+        assert_eq!(state.hash, expected_hash);
+    }
+
+    #[test]
+    fn test_hash_streams_different_receivers_produce_different_hashes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let r1 = Address::generate(&env);
+        let r2 = Address::generate(&env);
+
+        let list_a = soroban_sdk::vec![
+            &env,
+            StreamReceiver { receiver: r1.clone(), amt_per_sec: 10 },
+        ];
+        let list_b = soroban_sdk::vec![
+            &env,
+            StreamReceiver { receiver: r2.clone(), amt_per_sec: 10 },
+        ];
+        assert_ne!(client.hash_streams(&list_a), client.hash_streams(&list_b));
+    }
+
+    // ── #601 streams_state ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_streams_state_returns_zeros_when_no_stream_configured() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, _, token_address, _) = setup(&env);
+
+        let state = client.streams_state(&funder, &token_address);
+        assert_eq!(state.hash, BytesN::from_array(&env, &[0u8; 32]));
+        assert_eq!(state.last_update, 0);
+        assert_eq!(state.balance, 0);
+    }
+
+    #[test]
+    fn test_streams_state_after_set_stream_reflects_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, receiver, token_address, _) = setup(&env);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &20_000);
+
+        set_time(&env, 2_000);
+        let receivers = soroban_sdk::vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: 20,
+            },
+        ];
+        client.set_stream(&funder, &token_address, &receivers, &20_000);
+
+        let state = client.streams_state(&funder, &token_address);
+        assert_ne!(state.hash, BytesN::from_array(&env, &[0u8; 32]));
+        assert_eq!(state.last_update, 2_000);
+        assert_eq!(state.balance, 20_000);
+        assert_eq!(state.hash, client.hash_streams(&receivers));
+    }
+
+    #[test]
+    fn test_streams_state_hash_updates_after_second_set_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, receiver, token_address, _) = setup(&env);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &30_000);
+
+        set_time(&env, 1_000);
+        let receivers_v1 = soroban_sdk::vec![
+            &env,
+            StreamReceiver { receiver: receiver.clone(), amt_per_sec: 10 },
+        ];
+        client.set_stream(&funder, &token_address, &receivers_v1, &15_000);
+        let state_v1 = client.streams_state(&funder, &token_address);
+
+        set_time(&env, 2_000);
+        let receiver2 = Address::generate(&env);
+        let receivers_v2 = soroban_sdk::vec![
+            &env,
+            StreamReceiver { receiver: receiver2.clone(), amt_per_sec: 5 },
+        ];
+        client.set_stream(&funder, &token_address, &receivers_v2, &15_000);
+        let state_v2 = client.streams_state(&funder, &token_address);
+
+        assert_ne!(state_v1.hash, state_v2.hash);
+        assert_eq!(state_v2.last_update, 2_000);
+        assert_eq!(state_v2.hash, client.hash_streams(&receivers_v2));
     }
 }
