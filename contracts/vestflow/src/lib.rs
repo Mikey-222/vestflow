@@ -118,6 +118,12 @@ pub enum VestFlowError {
     AlreadyExists = 38,
     /// Receivers and amounts vectors have different lengths.
     LengthMismatch = 39,
+    /// The caller is not the current owner of a drips list.
+    NotOwner = 40,
+    /// Membership changes are disabled for a frozen drips list.
+    ListFrozen = 41,
+    /// A cumulative streamed or given total exceeded the supported range.
+    TotalOverflow = 42,
 }
 
 #[contracttype]
@@ -186,6 +192,12 @@ pub enum DataKey {
     BatchSlotClaimed(BytesN<32>),
     /// Monotonic counter of batches ever committed.
     BatchCounter,
+    /// Permanently frozen membership state for a drips list.
+    DripsListFrozen(u64),
+    /// Lifetime amount given by (account, token).
+    TotalGiven(Address, Address),
+    /// Lifetime amount streamed from (sender, receiver, token).
+    StreamAmountSent(Address, Address, Address),
     /// Ledger timestamp up to which a receiver's incoming drips-list streams
     /// have already been settled for a token: (receiver, token).
     ReceiverCheckpoint(Address, Address),
@@ -3690,7 +3702,12 @@ impl VestFlowContract {
     /// Add a member address to a drips list.
     ///
     /// Only the list owner can modify the list. Idempotent if member is already in the list.
-    pub fn add_to_drips_list(env: Env, owner: Address, list_id: u64, member: Address) {
+    pub fn add_to_drips_list(
+        env: Env,
+        owner: Address,
+        list_id: u64,
+        member: Address,
+    ) -> Result<(), VestFlowError> {
         owner.require_auth();
 
         let mut list: DripsList = env
@@ -3700,6 +3717,15 @@ impl VestFlowContract {
             .expect("List not found");
 
         assert!(list.owner == owner, "Not owner");
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::DripsListFrozen(list_id))
+            .unwrap_or(false)
+        {
+            return Err(VestFlowError::ListFrozen);
+        }
 
         if !list.members.contains(&member) {
             list.members.push_back(member);
@@ -3711,12 +3737,18 @@ impl VestFlowContract {
                 INSTANCE_TTL_EXTEND_TO_LEDGERS,
             );
         }
+        Ok(())
     }
 
     /// Remove a member address from a drips list.
     ///
     /// Only the list owner can modify the list.
-    pub fn remove_from_drips_list(env: Env, owner: Address, list_id: u64, member: Address) {
+    pub fn remove_from_drips_list(
+        env: Env,
+        owner: Address,
+        list_id: u64,
+        member: Address,
+    ) -> Result<(), VestFlowError> {
         owner.require_auth();
 
         let mut list: DripsList = env
@@ -3726,6 +3758,15 @@ impl VestFlowContract {
             .expect("List not found");
 
         assert!(list.owner == owner, "Not owner");
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::DripsListFrozen(list_id))
+            .unwrap_or(false)
+        {
+            return Err(VestFlowError::ListFrozen);
+        }
 
         let mut idx_to_remove: Option<u32> = None;
         for i in 0..list.members.len() {
@@ -3745,6 +3786,66 @@ impl VestFlowContract {
                 INSTANCE_TTL_EXTEND_TO_LEDGERS,
             );
         }
+        Ok(())
+    }
+
+    /// Transfer ownership of a drips list to another address.
+    ///
+    /// Only the current owner may transfer the list. Membership, target rate,
+    /// and any frozen state remain attached to the list.
+    pub fn transfer_drips_list_ownership(
+        env: Env,
+        current_owner: Address,
+        list_id: u64,
+        new_owner: Address,
+    ) -> Result<(), VestFlowError> {
+        current_owner.require_auth();
+        let mut list: DripsList = env
+            .storage()
+            .instance()
+            .get(&DataKey::DripsList(list_id))
+            .ok_or(VestFlowError::NotFound)?;
+        if list.owner != current_owner {
+            return Err(VestFlowError::NotOwner);
+        }
+
+        list.owner = new_owner.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::DripsList(list_id), &list);
+        env.storage().instance().extend_ttl(
+            INSTANCE_TTL_THRESHOLD_LEDGERS,
+            INSTANCE_TTL_EXTEND_TO_LEDGERS,
+        );
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(&env, "ownership_transferred"),
+                list_id,
+            ),
+            (current_owner, new_owner),
+        );
+        Ok(())
+    }
+
+    /// Permanently prevent membership changes to a drips list.
+    pub fn freeze_drips_list(env: Env, owner: Address, list_id: u64) -> Result<(), VestFlowError> {
+        owner.require_auth();
+        let list: DripsList = env
+            .storage()
+            .instance()
+            .get(&DataKey::DripsList(list_id))
+            .ok_or(VestFlowError::NotFound)?;
+        if list.owner != owner {
+            return Err(VestFlowError::NotOwner);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DripsListFrozen(list_id), &true);
+        env.storage().instance().extend_ttl(
+            INSTANCE_TTL_THRESHOLD_LEDGERS,
+            INSTANCE_TTL_EXTEND_TO_LEDGERS,
+        );
+        Ok(())
     }
 
     /// Set a target funding rate per second for a drips list.
@@ -3779,6 +3880,34 @@ impl VestFlowContract {
         );
     }
 
+    /// Transfer a one-time token gift to a receiver.
+    pub fn give(
+        env: Env,
+        sender: Address,
+        receiver: Address,
+        amount: i128,
+        token: Address,
+    ) -> Result<(), VestFlowError> {
+        sender.require_auth();
+        if amount <= 0 {
+            return Err(VestFlowError::AmountZero);
+        }
+        token::Client::new(&env, &token).transfer(&sender, &receiver, &amount);
+        let key = DataKey::TotalGiven(sender.clone(), token.clone());
+        let total: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let next_total = total
+            .checked_add(amount)
+            .ok_or(VestFlowError::TotalOverflow)?;
+        env.storage().instance().set(&key, &next_total);
+        env.storage().instance().extend_ttl(
+            INSTANCE_TTL_THRESHOLD_LEDGERS,
+            INSTANCE_TTL_EXTEND_TO_LEDGERS,
+        );
+        env.events()
+            .publish((symbol_short!("given"), sender, token), amount);
+        Ok(())
+    }
+
     /// Transfer one-time token gifts to multiple receivers atomically.
     pub fn batch_give(
         env: Env,
@@ -3808,6 +3937,12 @@ impl VestFlowContract {
             let receiver = receivers.get(i).expect("i < len");
             let amount = amounts.get(i).expect("i < len");
             token_client.transfer(&sender, &receiver, &amount);
+            let key = DataKey::TotalGiven(sender.clone(), token.clone());
+            let total: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            let next_total = total
+                .checked_add(amount)
+                .ok_or(VestFlowError::TotalOverflow)?;
+            env.storage().instance().set(&key, &next_total);
             env.events().publish(
                 (symbol_short!("given"), sender.clone(), token.clone()),
                 amount,
@@ -3965,6 +4100,29 @@ impl VestFlowContract {
         env.storage()
             .instance()
             .get(&DataKey::StreamBalance(account, token))
+            .unwrap_or(0)
+    }
+
+    /// Lifetime amount of `token` that `account` has sent through `give` and
+    /// `batch_give`. The value is independent of the receiver's current balance.
+    pub fn total_given(env: Env, account: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalGiven(account, token))
+            .unwrap_or(0)
+    }
+
+    /// Lifetime amount of `token` streamed from `sender` to `receiver`.
+    /// Settled value remains counted after collection or stream reconfiguration.
+    pub fn stream_amount_sent_to(
+        env: Env,
+        sender: Address,
+        receiver: Address,
+        token: Address,
+    ) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::StreamAmountSent(sender, receiver, token))
             .unwrap_or(0)
     }
 
@@ -4672,6 +4830,17 @@ impl VestFlowContract {
                 env.storage()
                     .instance()
                     .set(&key, &accrued.checked_add(share).expect("Accrued overflow"));
+
+                let sent_key = DataKey::StreamAmountSent(
+                    funder.clone(),
+                    receiver.receiver.clone(),
+                    token.clone(),
+                );
+                let sent: i128 = env.storage().instance().get(&sent_key).unwrap_or(0);
+                let total_sent = sent
+                    .checked_add(share)
+                    .expect("Stream amount sent overflow");
+                env.storage().instance().set(&sent_key, &total_sent);
             }
         }
 
@@ -9795,6 +9964,74 @@ mod test {
     }
 
     #[test]
+    fn test_drips_list_ownership_transfer_emits_event_and_allows_new_owner_edits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, member, _, _) = setup(&env);
+        let new_owner = Address::generate(&env);
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Transferable"));
+
+        client.transfer_drips_list_ownership(&owner, &list_id, &new_owner);
+
+        let transfer_event = env.events().all().iter().any(|(_, topics, _)| {
+            let event: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            event == soroban_sdk::Symbol::new(&env, "ownership_transferred")
+        });
+        assert!(transfer_event);
+
+        client.add_to_drips_list(&new_owner, &list_id, &member);
+        client.set_drips_list_target_rate(&new_owner, &list_id, &500);
+        assert_eq!(client.get_drips_list(&list_id).unwrap().owner, new_owner);
+        assert_eq!(client.get_drips_list(&list_id).unwrap().members.len(), 1);
+        assert_eq!(client.get_drips_list_target_rate(&list_id), 500);
+    }
+
+    #[test]
+    fn test_drips_list_ownership_transfer_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, _, _, _) = setup(&env);
+        let stranger = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Transferable"));
+
+        assert_eq!(
+            client.try_transfer_drips_list_ownership(&stranger, &list_id, &new_owner),
+            Err(Ok(VestFlowError::NotOwner))
+        );
+        assert_eq!(client.get_drips_list(&list_id).unwrap().owner, owner);
+    }
+
+    #[test]
+    fn test_frozen_drips_list_rejects_add_and_remove_permanently() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, member, _, _) = setup(&env);
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Frozen"));
+        client.add_to_drips_list(&owner, &list_id, &member);
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_freeze_drips_list(&stranger, &list_id),
+            Err(Ok(VestFlowError::NotOwner))
+        );
+        client.freeze_drips_list(&owner, &list_id);
+
+        assert_eq!(
+            client.try_add_to_drips_list(&owner, &list_id, &Address::generate(&env)),
+            Err(Ok(VestFlowError::ListFrozen))
+        );
+        assert_eq!(
+            client.try_remove_from_drips_list(&owner, &list_id, &member),
+            Err(Ok(VestFlowError::ListFrozen))
+        );
+        assert_eq!(client.get_drips_list(&list_id).unwrap().members.len(), 1);
+        assert_eq!(client.try_freeze_drips_list(&owner, &list_id), Ok(Ok(())));
+    }
+
+    #[test]
     #[should_panic(expected = "Not owner")]
     fn test_add_to_drips_list_non_owner_rejected() {
         let env = Env::default();
@@ -10146,6 +10383,40 @@ mod test {
         assert_eq!(token.balance(&sender), sender_before - 350);
         assert_eq!(token.balance(&receiver1), 100);
         assert_eq!(token.balance(&receiver2), 250);
+    }
+
+    #[test]
+    fn test_total_given_tracks_single_and_batch_gives() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_address);
+        let receiver1 = Address::generate(&env);
+        let receiver2 = Address::generate(&env);
+
+        assert_eq!(client.total_given(&sender, &token_address), 0);
+        client.give(&sender, &receiver1, &125, &token_address);
+        assert_eq!(client.total_given(&sender, &token_address), 125);
+
+        client.batch_give(
+            &sender,
+            &soroban_sdk::vec![&env, receiver1, receiver2],
+            &soroban_sdk::vec![&env, 100i128, 250i128],
+            &token_address,
+        );
+        assert_eq!(client.total_given(&sender, &token_address), 475);
+        assert_eq!(token.balance(&sender), 10_000 - 475);
+    }
+
+    #[test]
+    fn test_total_given_rejects_zero_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, receiver, token_address, _) = setup(&env);
+        assert_eq!(
+            client.try_give(&sender, &receiver, &0, &token_address),
+            Err(Ok(VestFlowError::AmountZero))
+        );
     }
 
     #[test]
@@ -10715,6 +10986,58 @@ mod test {
         assert_eq!(
             version,
             soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn test_stream_amount_sent_to_tracks_multiple_settlements_and_collection() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let receiver = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&sender, &(10 * CYCLE_SECS as i128 * 3));
+        let receivers = soroban_sdk::vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: 10,
+            },
+        ];
+
+        assert_eq!(
+            client.stream_amount_sent_to(&sender, &receiver, &token_address),
+            0
+        );
+        set_time(&env, 1_000);
+        client.set_stream(
+            &sender,
+            &token_address,
+            &receivers,
+            &(10 * CYCLE_SECS as i128 * 3),
+        );
+
+        set_time(&env, 1_000 + CYCLE_SECS as u64);
+        assert_eq!(
+            client.receive_streams(&sender, &token_address, &receivers, &i128::MAX),
+            10 * CYCLE_SECS as i128
+        );
+        assert_eq!(
+            client.stream_amount_sent_to(&sender, &receiver, &token_address),
+            10 * CYCLE_SECS as i128
+        );
+
+        set_time(&env, 1_000 + 2 * CYCLE_SECS as u64);
+        client.receive_streams(&sender, &token_address, &receivers, &i128::MAX);
+        assert_eq!(
+            client.stream_amount_sent_to(&sender, &receiver, &token_address),
+            20 * CYCLE_SECS as i128
+        );
+        client.collect(&receiver, &token_address, &i128::MAX);
+        assert_eq!(
+            client.stream_amount_sent_to(&sender, &receiver, &token_address),
+            20 * CYCLE_SECS as i128
         );
     }
 
