@@ -3933,21 +3933,38 @@ impl VestFlowContract {
         }
 
         let token_client = token::Client::new(&env, &token);
-        for i in 0..receivers.len() {
-            let receiver = receivers.get(i).expect("i < len");
-            let amount = amounts.get(i).expect("i < len");
+
+        // Issue #949: `TotalGiven` is keyed by `(sender, token)` alone, so every
+        // iteration of the loop below was reading and writing the *same* entry.
+        // Hoisting the load and accumulating in a local keeps the totals
+        // identical while making the storage cost O(1) instead of O(n).
+        //
+        // Note this is a real but modest win — the benchmark in
+        // `tests/batch_give_benchmark.rs` shows the dominant per-receiver cost
+        // is the token transfer itself, not this bookkeeping.
+        let total_given_key = DataKey::TotalGiven(sender.clone(), token.clone());
+        let mut total_given: i128 = env.storage().instance().get(&total_given_key).unwrap_or(0);
+
+        // Iterate rather than index: `Vec::get(i)` is a host read per call, and
+        // the previous form paid two of them per receiver.
+        for (receiver, amount) in receivers.iter().zip(amounts.iter()) {
             token_client.transfer(&sender, &receiver, &amount);
-            let key = DataKey::TotalGiven(sender.clone(), token.clone());
-            let total: i128 = env.storage().instance().get(&key).unwrap_or(0);
-            let next_total = total
+            total_given = total_given
                 .checked_add(amount)
                 .ok_or(VestFlowError::TotalOverflow)?;
-            env.storage().instance().set(&key, &next_total);
             env.events().publish(
                 (symbol_short!("given"), sender.clone(), token.clone()),
                 amount,
             );
         }
+
+        env.storage().instance().set(&total_given_key, &total_given);
+        // `give` extends the instance TTL after touching `TotalGiven`; do the
+        // same here so a batch cannot age the entry out from under us.
+        env.storage().instance().extend_ttl(
+            INSTANCE_TTL_THRESHOLD_LEDGERS,
+            INSTANCE_TTL_EXTEND_TO_LEDGERS,
+        );
 
         Ok(())
     }
