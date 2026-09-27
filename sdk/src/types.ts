@@ -185,6 +185,41 @@ export interface Stream {
 }
 
 /**
+ * The live configuration of one (sender, receiver, token) stream, as reported
+ * by the indexer.
+ *
+ * Richer than {@link Stream}: it also carries the sender's remaining
+ * streamable `balance` and when the stream `startTime`, so a caller can judge
+ * whether the stream can actually run to `maxEndTime` without doing a second
+ * round trip.
+ */
+export interface StreamConfig {
+  /** Stellar address of the account that opened the stream (the sender). */
+  sender: string;
+  /** Stellar address receiving the streamed tokens. */
+  receiver: string;
+  /** Stellar Asset Contract address of the streamed token. */
+  token: string;
+  /** Constant flow rate in stroops (base units) per second. */
+  ratePerSec: bigint;
+  /** Unix timestamp (seconds) at which the stream was opened. */
+  startTime: number;
+  /**
+   * Sender's remaining streamable balance for `token`, in stroops (base units).
+   *
+   * This is the balance the stream draws down, not the sender's wallet
+   * balance, and it is the number that decides whether the stream survives
+   * to `maxEndTime`.
+   */
+  balance: bigint;
+  /**
+   * Unix timestamp (seconds) at which the stream stops, or `null` for an
+   * open-ended stream that will run until the balance is exhausted.
+   */
+  maxEndTime: number | null;
+}
+
+/**
  * A receiver in a sender's stream configuration, as recorded in
  * {@link StreamsHistory}.
  */
