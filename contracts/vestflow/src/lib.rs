@@ -186,6 +186,12 @@ pub enum DataKey {
     BatchSlotClaimed(BytesN<32>),
     /// Monotonic counter of batches ever committed.
     BatchCounter,
+    /// Ledger timestamp up to which a receiver's incoming drips-list streams
+    /// have already been settled for a token: (receiver, token).
+    ReceiverCheckpoint(Address, Address),
+    /// All-time cumulative amount of a token an account has collected via
+    /// `collect`: (account, token).
+    TotalReceived(Address, Address),
 }
 
 /// Storage keys for claim delegations, keyed separately from [`DataKey`] so
@@ -4085,6 +4091,161 @@ impl VestFlowContract {
         collectable.min(Self::total_balance(env, token))
     }
 
+    /// Number of full drips cycles of unsettled incoming drips-list streams
+    /// waiting for `account` to process with [`VestFlowContract::receive_stream_cycles`].
+    ///
+    /// Returns 0 when `account` has no incoming drips-list stream for `token`,
+    /// or nothing has accrued since the last settlement.
+    pub fn receivable_cycles(env: Env, account: Address, token: Address) -> u32 {
+        let now = env.ledger().timestamp();
+        let checkpoint: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReceiverCheckpoint(account.clone(), token.clone()))
+            .unwrap_or(0);
+
+        let list_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberStreamLists(account.clone()))
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut pending_secs: u64 = 0;
+        for list_id in list_ids.iter() {
+            let stream: DripsStream = match env
+                .storage()
+                .instance()
+                .get(&DataKey::DripsStream(list_id, account.clone()))
+            {
+                Some(stream) => stream,
+                None => continue,
+            };
+            if stream.token != token || stream.amt_per_sec <= 0 {
+                continue;
+            }
+
+            let effective_end = if stream.paused_at != 0 {
+                stream.paused_at
+            } else {
+                now
+            };
+            let effective_start = stream.start_time.max(checkpoint);
+            if effective_end > effective_start {
+                pending_secs = pending_secs.max(effective_end - effective_start);
+            }
+        }
+
+        (pending_secs / CYCLE_SECS as u64) as u32
+    }
+
+    /// Settle up to `max_cycles` worth of `account`'s incoming drips-list
+    /// streams for `token`, moving the settled amount into its collectable
+    /// (`Accrued`) balance so a later [`VestFlowContract::collect`] can pay it
+    /// out. Processing at most `max_cycles` at a time allows incremental
+    /// settlement for receivers with a long backlog.
+    ///
+    /// Each stream's funder balance caps how much of it can actually settle;
+    /// // ponytail: a stream whose funder runs out of balance mid-window
+    /// // forfeits the unfunded remainder instead of carrying it forward —
+    /// // add carry-forward accounting if underfunded streams need it.
+    ///
+    /// Returns 0 when [`VestFlowContract::receivable_cycles`] is 0.
+    pub fn receive_stream_cycles(
+        env: Env,
+        account: Address,
+        token: Address,
+        max_cycles: u32,
+    ) -> i128 {
+        if max_cycles == 0 {
+            return 0;
+        }
+
+        let now = env.ledger().timestamp();
+        let checkpoint: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReceiverCheckpoint(account.clone(), token.clone()))
+            .unwrap_or(0);
+        let window_end = checkpoint.saturating_add(max_cycles as u64 * CYCLE_SECS as u64);
+
+        let list_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberStreamLists(account.clone()))
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut received: i128 = 0;
+        let mut latest_settled = checkpoint;
+
+        for list_id in list_ids.iter() {
+            let stream: DripsStream = match env
+                .storage()
+                .instance()
+                .get(&DataKey::DripsStream(list_id, account.clone()))
+            {
+                Some(stream) => stream,
+                None => continue,
+            };
+            if stream.token != token || stream.amt_per_sec <= 0 {
+                continue;
+            }
+
+            let effective_end = if stream.paused_at != 0 {
+                stream.paused_at
+            } else {
+                now
+            };
+            let effective_start = stream.start_time.max(checkpoint);
+            let settle_to = effective_end.min(window_end);
+            if settle_to <= effective_start {
+                continue;
+            }
+
+            let elapsed: i128 = (settle_to - effective_start) as i128;
+            let accrued = stream.amt_per_sec.saturating_mul(elapsed);
+
+            let balance_key = DataKey::StreamBalance(stream.funder.clone(), token.clone());
+            let funder_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+            let settled = accrued.min(funder_balance).max(0);
+            if settled == 0 {
+                continue;
+            }
+
+            env.storage()
+                .instance()
+                .set(&balance_key, &(funder_balance - settled));
+
+            received = received.saturating_add(settled);
+            latest_settled = latest_settled.max(settle_to);
+        }
+
+        if received == 0 {
+            return 0;
+        }
+
+        let accrued_key = DataKey::Accrued(account.clone(), token.clone());
+        let prior: i128 = env.storage().instance().get(&accrued_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&accrued_key, &(prior + received));
+        env.storage().instance().set(
+            &DataKey::ReceiverCheckpoint(account.clone(), token.clone()),
+            &latest_settled,
+        );
+        env.storage().instance().extend_ttl(
+            INSTANCE_TTL_THRESHOLD_LEDGERS,
+            INSTANCE_TTL_EXTEND_TO_LEDGERS,
+        );
+
+        let cycles_processed = ((latest_settled - checkpoint) / CYCLE_SECS as u64) as u32;
+        env.events().publish(
+            (symbol_short!("cyc_recv"), account, token),
+            (cycles_processed, received),
+        );
+
+        received
+    }
+
     /// How much of `token` `receiver` is projected to be able to collect once
     /// the current drips cycle ends, assuming no stream is opened or closed in
     /// the meantime.
@@ -4221,6 +4382,12 @@ impl VestFlowContract {
     /// Check whether `sender` currently has an active (non-zero rate) stream configured to `receiver` for `token`.
     pub fn is_stream_active(env: Env, sender: Address, receiver: Address, token: Address) -> bool {
         Self::stream_rate_for(env, sender, receiver, token) > 0
+    }
+
+    /// Quick check for whether `sender` has any non-zero rate stream configured
+    /// to `receiver` for `token`, without loading the full stream config.
+    pub fn stream_exists(env: Env, sender: Address, receiver: Address, token: Address) -> bool {
+        Self::is_stream_active(env, sender, receiver, token)
     }
 
     /// Pull unused streaming balance back to `account`.
@@ -4552,6 +4719,16 @@ impl VestFlowContract {
                     .checked_sub(transfer_amount)
                     .expect("Accrued underflow"),
             );
+
+            let total_key = DataKey::TotalReceived(account.clone(), token.clone());
+            let total: i128 = env.storage().instance().get(&total_key).unwrap_or(0);
+            env.storage().instance().set(
+                &total_key,
+                &total
+                    .checked_add(transfer_amount)
+                    .expect("Total received overflow"),
+            );
+
             env.storage().instance().extend_ttl(
                 INSTANCE_TTL_THRESHOLD_LEDGERS,
                 INSTANCE_TTL_EXTEND_TO_LEDGERS,
@@ -4561,6 +4738,17 @@ impl VestFlowContract {
             .publish((symbol_short!("strm_col"), account, token), transfer_amount);
 
         transfer_amount
+    }
+
+    /// All-time cumulative amount of `token` `account` has ever collected via
+    /// [`VestFlowContract::collect`].
+    ///
+    /// Returns 0 for an account that has never collected.
+    pub fn total_received(env: Env, account: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalReceived(account, token))
+            .unwrap_or(0)
     }
 
     /// Pause all outgoing streams of `account` for `token`.
@@ -10206,6 +10394,95 @@ mod test {
     }
 
     #[test]
+    fn test_receivable_cycles_zero_states() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, member1, token_address, _) = setup(&env);
+        set_time(&env, 1_000);
+
+        // No incoming stream at all -> 0.
+        assert_eq!(client.receivable_cycles(&member1, &token_address), 0);
+        assert_eq!(client.receive_stream_cycles(&member1, &token_address, &10), 0);
+
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Payroll"));
+        client.add_to_drips_list(&owner, &list_id, &member1);
+        client.fund_drips_list(&owner, &list_id, &token_address, &1, &10_000);
+
+        // Stream just opened -> nothing has accrued yet.
+        assert_eq!(client.receivable_cycles(&member1, &token_address), 0);
+    }
+
+    #[test]
+    fn test_receive_stream_cycles_settles_one_cycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, member1, token_address, _) = setup(&env);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&owner, &10_000_000);
+        set_time(&env, 0);
+
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Payroll"));
+        client.add_to_drips_list(&owner, &list_id, &member1);
+        client.fund_drips_list(&owner, &list_id, &token_address, &1, &10_000_000);
+
+        let cycle_secs = client.cycle_secs() as i128;
+        set_time(&env, cycle_secs as u64);
+
+        assert_eq!(client.receivable_cycles(&member1, &token_address), 1);
+
+        let received = client.receive_stream_cycles(&member1, &token_address, &10);
+        assert_eq!(received, cycle_secs);
+        assert_eq!(client.receivable_cycles(&member1, &token_address), 0);
+        // A second call has nothing left to settle.
+        assert_eq!(client.receive_stream_cycles(&member1, &token_address, &10), 0);
+
+        // Settled funds moved into the receiver's collectable balance and out
+        // of the funder's streamable balance.
+        assert_eq!(
+            client.collect(&member1, &token_address, &i128::MAX),
+            cycle_secs
+        );
+        assert_eq!(
+            client.stream_balance(&owner, &token_address),
+            10_000_000 - cycle_secs
+        );
+    }
+
+    #[test]
+    fn test_receive_stream_cycles_multiple_cycles_and_max_cycles_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, member1, token_address, _) = setup(&env);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&owner, &10_000_000);
+        set_time(&env, 0);
+
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Payroll"));
+        client.add_to_drips_list(&owner, &list_id, &member1);
+        client.fund_drips_list(&owner, &list_id, &token_address, &1, &10_000_000);
+
+        let cycle_secs = client.cycle_secs() as i128;
+        // 5 cycles elapse.
+        set_time(&env, (cycle_secs * 5) as u64);
+        assert_eq!(client.receivable_cycles(&member1, &token_address), 5);
+
+        // Cap at 2 cycles -> only 2 settle, 3 remain pending (incremental settlement).
+        let received = client.receive_stream_cycles(&member1, &token_address, &2);
+        assert_eq!(received, cycle_secs * 2);
+        assert_eq!(client.receivable_cycles(&member1, &token_address), 3);
+
+        // Settle the rest.
+        let received_rest = client.receive_stream_cycles(&member1, &token_address, &10);
+        assert_eq!(received_rest, cycle_secs * 3);
+        assert_eq!(client.receivable_cycles(&member1, &token_address), 0);
+    }
+
+    #[test]
     fn test_is_stream_active_and_stream_rate_for() {
         let env = Env::default();
         env.mock_all_auths();
@@ -10234,6 +10511,38 @@ mod test {
         client.fund_drips_list(&owner, &list_id, &token_address, &0, &0);
         assert_eq!(client.stream_rate_for(&owner, &member1, &token_address), 0);
         assert!(!client.is_stream_active(&owner, &member1, &token_address));
+    }
+
+    #[test]
+    fn test_stream_exists_true_false_and_after_close() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, member1, token_address, _) = setup(&env);
+        let stranger = Address::generate(&env);
+
+        // No stream configured -> does not exist.
+        assert!(!client.stream_exists(&funder, &member1, &token_address));
+
+        client.set_stream(
+            &funder,
+            &token_address,
+            &soroban_sdk::vec![
+                &env,
+                StreamReceiver {
+                    receiver: member1.clone(),
+                    amt_per_sec: 10,
+                },
+            ],
+            &1000,
+        );
+
+        // Configured stream -> exists; an unrelated pair still does not.
+        assert!(client.stream_exists(&funder, &member1, &token_address));
+        assert!(!client.stream_exists(&funder, &stranger, &token_address));
+
+        // Close the stream by setting its rate to 0.
+        client.update_stream_rate(&funder, &token_address, &member1, &0);
+        assert!(!client.stream_exists(&funder, &member1, &token_address));
     }
 
     #[test]
@@ -10531,6 +10840,42 @@ mod test {
 
         // Double-collect is a no-op.
         assert_eq!(client.collect(&receiver_a, &token_address, &100), 0);
+    }
+
+    #[test]
+    fn test_total_received_zero_then_accumulates_across_collects() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, member1, token_address, _) = setup(&env);
+
+        // Never collected -> 0.
+        assert_eq!(client.total_received(&member1, &token_address), 0);
+
+        set_time(&env, 1000);
+        let receivers = soroban_sdk::vec![
+            &env,
+            StreamReceiver {
+                receiver: member1.clone(),
+                amt_per_sec: 10,
+            },
+        ];
+        client.set_stream(&funder, &token_address, &receivers, &1000);
+
+        // 50s at 10/sec -> 500 accrued.
+        set_time(&env, 1050);
+        client.receive_streams(&funder, &token_address, &receivers, &i128::MAX);
+
+        // First (partial) collect.
+        client.collect(&member1, &token_address, &300);
+        assert_eq!(client.total_received(&member1, &token_address), 300);
+
+        // Second collect accumulates on top of the first.
+        client.collect(&member1, &token_address, &i128::MAX);
+        assert_eq!(client.total_received(&member1, &token_address), 500);
+
+        // Collecting nothing further leaves the total unchanged.
+        client.collect(&member1, &token_address, &i128::MAX);
+        assert_eq!(client.total_received(&member1, &token_address), 500);
     }
 
     #[test]
