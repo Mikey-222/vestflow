@@ -27,6 +27,8 @@ import {
   queryDripsSplits,
   queryDripsStreams,
   queryEvents,
+  DEFAULT_EXPIRY_WINDOW_DAYS,
+  queryExpiringStreams,
   queryGives,
   queryGivesForAccount,
   queryHistory,
@@ -210,6 +212,42 @@ function handleStreams(
   const body = { streams: page.items, next_cursor: page.nextCursor };
   const lastUpdated = getDripsStreamsLastUpdated(account, network);
   return jsonWithEtag(res, body, lastUpdated, ifNoneMatch);
+}
+
+/**
+ * Issue #947 — `GET /streams/expiring?account=&windowDays=`.
+ *
+ * Returns the account's open streams that are projected to finish inside the
+ * look-ahead window (default 7 days), soonest first. Open-ended streams and
+ * streams that have already ended are excluded; see `queryExpiringStreams`.
+ */
+function handleStreamsExpiring(res: http.ServerResponse, searchParams: URLSearchParams): void {
+  const account = searchParams.get("account");
+  const network = networkParam(searchParams);
+  if (!account || !STELLAR_ADDRESS.test(account))
+    return json(res, 400, { error: "account must be a valid Stellar address" });
+  if (!network)
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+
+  const rawWindow = searchParams.get("windowDays");
+  let windowDays: number | undefined;
+  if (rawWindow != null) {
+    const parsed = Number(rawWindow);
+    if (!Number.isInteger(parsed) || parsed <= 0)
+      return json(res, 400, { error: "windowDays must be a positive integer" });
+    windowDays = parsed;
+  }
+
+  const limit = limitParam(searchParams);
+  if (limit === null) return json(res, 400, { error: "limit must be a positive integer" });
+
+  const streams = queryExpiringStreams({ account, windowDays, limit, network });
+  return json(res, 200, {
+    account,
+    network,
+    window_days: windowDays ?? DEFAULT_EXPIRY_WINDOW_DAYS,
+    streams,
+  });
 }
 
 function handleSplits(res: http.ServerResponse, searchParams: URLSearchParams, ifNoneMatch?: string): void {
@@ -866,6 +904,8 @@ export function createServer(): http.Server {
 
       case "/streams":
         return handleStreams(res, url.searchParams, req.headers["if-none-match"]);
+      case "/streams/expiring":
+        return handleStreamsExpiring(res, url.searchParams);
 
       case "/splits":
         return handleSplits(res, url.searchParams, req.headers["if-none-match"]);

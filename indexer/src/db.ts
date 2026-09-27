@@ -1514,6 +1514,56 @@ export function queryDripsStreams(params: {
   };
 }
 
+/** Default look-ahead for {@link queryExpiringStreams}, in days. */
+export const DEFAULT_EXPIRY_WINDOW_DAYS = 7;
+
+/** Largest look-ahead {@link queryExpiringStreams} will accept, in days. */
+export const MAX_EXPIRY_WINDOW_DAYS = 365;
+
+/**
+ * Issue #947 — open outgoing streams for `account` that are due to finish
+ * within `windowDays` of now.
+ *
+ * "Expiring" means `estimated_end_time` has been projected by the funder but not
+ * yet reached, so these are the streams a user would want to act on (top up,
+ * extend, or let run out). Streams with no projected end are excluded because
+ * they are open-ended and never "expire"; streams already past their end or
+ * explicitly closed are excluded because there is nothing left to do.
+ *
+ * The lower bound (`estimated_end_time > now`) matters: without it a stream
+ * that finished inside the window but has not been reaped yet would be reported
+ * as expiring when it has in fact already ended.
+ *
+ * Not keyset-paginated. This feeds a "what needs attention soon" panel, so it is
+ * ordered by how soon each stream ends and hard-capped; callers wanting full
+ * enumeration should use `queryDripsStreams`.
+ */
+export function queryExpiringStreams(params: {
+  account: string;
+  windowDays?: number;
+  limit?: number;
+  network?: NetworkName;
+}): DripsStream[] {
+  const windowDays = Math.min(
+    Math.max(params.windowDays ?? DEFAULT_EXPIRY_WINDOW_DAYS, 1),
+    MAX_EXPIRY_WINDOW_DAYS,
+  );
+  const now = Math.floor(Date.now() / 1000);
+  const horizon = now + windowDays * 86_400;
+  const rows = getDb(params.network)
+    .prepare(
+      `SELECT receiver, token, rate_per_second, estimated_end_time
+     FROM drips_streams
+     WHERE account = ? AND ended_at IS NULL
+       AND estimated_end_time IS NOT NULL
+       AND estimated_end_time > ? AND estimated_end_time <= ?
+     ORDER BY estimated_end_time ASC
+     LIMIT ?`,
+    )
+    .all(params.account, now, horizon, boundedPageSize(params.limit)) as DripsStream[];
+  return rows;
+}
+
 /**
  * Active incoming streams for a receiver — streams opened by other senders
  * where `receiver = ?`, not closed, and not past their estimated end time.
