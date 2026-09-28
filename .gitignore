@@ -62,3 +62,11 @@ contracts/target/
 /sdk/dist/
 /sdk/package-lock.json
 
+# Standalone API server package
+/api/node_modules/
+/api/dist/
+/api/coverage/
+/api/package-lock.json
+!/.env.example
+!/api/.env.example
+

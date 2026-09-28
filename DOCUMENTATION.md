@@ -424,6 +424,9 @@ the DAO contract supports this before creating the schedule.
 
 ## Troubleshooting
 
+> For the complete table of contract error codes with a remediation step for
+> each one, see [`docs/contract-errors.md`](docs/contract-errors.md).
+
 ### Common Issues
 
 #### "Insufficient Balance" Error
