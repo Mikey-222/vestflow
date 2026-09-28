@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 5,
+    "address": 6,
     "nonce": 0
   },
   "auth": [
@@ -49,6 +49,7 @@
         }
       ]
     ],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
@@ -56,44 +57,46 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "create_schedule",
+              "function_name": "set_stream",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
                 },
                 {
-                  "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
+                  "vec": [
+                    {
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "amt_per_sec"
+                          },
+                          "val": {
+                            "i128": {
+                              "hi": 0,
+                              "lo": 10
+                            }
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "receiver"
+                          },
+                          "val": {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                          }
+                        }
+                      ]
+                    }
+                  ]
                 },
                 {
                   "i128": {
                     "hi": 0,
                     "lo": 1000
                   }
-                },
-                {
-                  "u64": 0
-                },
-                {
-                  "u64": 2000
-                },
-                {
-                  "u64": 1000
-                },
-                {
-                  "u64": 1000
-                },
-                {
-                  "vec": [
-                    {
-                      "symbol": "LinearWithCliff"
-                    }
-                  ]
-                },
-                {
-                  "bool": true
                 }
               ]
             }
@@ -128,9 +131,6 @@
     ],
     [],
     [],
-    [],
-    [],
-    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
@@ -138,10 +138,22 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "revoke",
+              "function_name": "update_stream_rate",
               "args": [
                 {
-                  "u64": 1
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
                 }
               ]
             }
@@ -150,20 +162,17 @@
         }
       ]
     ],
-    [],
-    [],
-    [],
     []
   ],
   "ledger": {
     "protocol_version": 22,
     "sequence_number": 0,
-    "timestamp": 1500,
+    "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
-    "base_reserve": 10,
-    "min_persistent_entry_ttl": 10,
-    "min_temp_entry_ttl": 10,
-    "max_entry_ttl": 3110400,
+    "base_reserve": 0,
+    "min_persistent_entry_ttl": 4096,
+    "min_temp_entry_ttl": 16,
+    "max_entry_ttl": 6312000,
     "ledger_entries": [
       [
         {
@@ -253,48 +262,13 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "BeneficiarySchedules"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "vec": [
-                            {
-                              "u64": 1
-                            }
-                          ]
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "GrantorSchedules"
+                              "symbol": "AccountTokenStreams"
                             },
                             {
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "vec": [
-                            {
-                              "u64": 1
-                            }
-                          ]
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "Schedule"
                             },
                             {
-                              "u64": 1
+                              "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
                             }
                           ]
                         },
@@ -302,42 +276,18 @@
                           "map": [
                             {
                               "key": {
-                                "symbol": "beneficiary"
-                              },
-                              "val": {
-                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "claimed_amount"
+                                "symbol": "balance"
                               },
                               "val": {
                                 "i128": {
                                   "hi": 0,
-                                  "lo": 500
+                                  "lo": 1000
                                 }
                               }
                             },
                             {
                               "key": {
-                                "symbol": "cliff_seconds"
-                              },
-                              "val": {
-                                "u64": 1000
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "duration_seconds"
-                              },
-                              "val": {
-                                "u64": 2000
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "grantor"
+                                "symbol": "funder"
                               },
                               "val": {
                                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -345,86 +295,18 @@
                             },
                             {
                               "key": {
-                                "symbol": "id"
+                                "symbol": "last_update"
                               },
                               "val": {
-                                "u64": 1
+                                "u64": 0
                               }
                             },
                             {
                               "key": {
-                                "symbol": "kind"
-                              },
-                              "val": {
-                                "vec": [
-                                  {
-                                    "symbol": "LinearWithCliff"
-                                  }
-                                ]
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "lockup_duration"
-                              },
-                              "val": {
-                                "u64": 1000
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "milestones"
+                                "symbol": "receivers"
                               },
                               "val": {
                                 "vec": []
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "paused"
-                              },
-                              "val": {
-                                "bool": false
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "paused_at"
-                              },
-                              "val": {
-                                "u64": 0
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "paused_duration"
-                              },
-                              "val": {
-                                "u64": 0
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "requires_milestones"
-                              },
-                              "val": {
-                                "bool": false
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "revocable"
-                              },
-                              "val": {
-                                "bool": true
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "revoked"
-                              },
-                              "val": {
-                                "bool": true
                               }
                             },
                             {
@@ -442,28 +324,6 @@
                               "val": {
                                 "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
                               }
-                            },
-                            {
-                              "key": {
-                                "symbol": "total_amount"
-                              },
-                              "val": {
-                                "i128": {
-                                  "hi": 0,
-                                  "lo": 1000
-                                }
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "vested_at_revoke"
-                              },
-                              "val": {
-                                "i128": {
-                                  "hi": 0,
-                                  "lo": 500
-                                }
-                              }
                             }
                           ]
                         }
@@ -472,12 +332,21 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "ScheduleCount"
+                              "symbol": "StreamBalance"
+                            },
+                            {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                            },
+                            {
+                              "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
                             }
                           ]
                         },
                         "val": {
-                          "u64": 1
+                          "i128": {
+                            "hi": 0,
+                            "lo": 1000
+                          }
                         }
                       }
                     ]
@@ -487,7 +356,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ],
       [
@@ -520,7 +389,7 @@
             },
             "ext": "v0"
           },
-          3110399
+          6311999
         ]
       ],
       [
@@ -553,7 +422,7 @@
             },
             "ext": "v0"
           },
-          3110399
+          6311999
         ]
       ],
       [
@@ -633,7 +502,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 0
+                          "lo": 1000
                         }
                       }
                     },
@@ -706,80 +575,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 9500
-                        }
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "authorized"
-                      },
-                      "val": {
-                        "bool": true
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "clawback"
-                      },
-                      "val": {
-                        "bool": false
-                      }
-                    }
-                  ]
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          518400
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "Balance"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG",
-                "key": {
-                  "vec": [
-                    {
-                      "symbol": "Balance"
-                    },
-                    {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                    }
-                  ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 500
+                          "lo": 9000
                         }
                       }
                     },
@@ -938,7 +734,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ]
     ]

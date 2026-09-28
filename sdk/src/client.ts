@@ -1689,11 +1689,11 @@ export class VestflowClient {
 
     const args: xdr.ScVal[] = [
       nativeToScVal(sender, { type: "address" }),
+      nativeToScVal(token, { type: "address" }),
       xdr.ScVal.scvVec(
         receivers.map((r) => nativeToScVal(r, { type: "address" }))
       ),
       xdr.ScVal.scvVec(amounts.map((a) => nativeToScVal(a, { type: "i128" }))),
-      nativeToScVal(token, { type: "address" }),
     ];
     return this.submitAndSettle(sender, "batch_give", args, signer);
   }
