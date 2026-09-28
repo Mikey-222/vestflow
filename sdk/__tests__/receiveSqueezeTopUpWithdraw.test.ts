@@ -59,23 +59,14 @@ describe("receiveStreams (#846)", () => {
       .spyOn(client as any, "buildAndSend")
       .mockResolvedValue("should-not-be-called");
 
-    // simulate returns a value that scValToNative maps to 0
-    vi.spyOn(client as any, "simulate").mockImplementation(async () => {
-      // Overwrite scValToNative behaviour by having the method receive 0 back.
-      // We achieve this by making the simulate private spy return an object
-      // that the real BigInt() coercion will read as 0 — but because the
-      // private method does `BigInt(scValToNative(val) ?? 0)` and scValToNative
-      // is not mocked here, the safest approach is to mock simulate to throw
-      // so the catch sets receivable = 1n... except we want receivable = 0n.
-      // To get receivable = 0n we need simulate to return something where
-      // scValToNative gives 0. We can do this by spying on the module.
-      // For simplicity we directly set receivable=0 by having simulate resolve
-      // AND mocking scValToNative at the module level.
-      return 0 as any;
-    });
-
-    // Since scValToNative(0) === 0, BigInt(0) === 0n, receivable === 0n.
-    // The method should short-circuit.
+    // simulate must return a real ScVal, not a bare 0: the method calls
+    // `scValToNative(val)`, which reads `val.switch()` and therefore throws on
+    // a raw number. That throw would land in the catch, which sets the
+    // 1n "proceed anyway" sentinel and submit a transaction — the opposite of
+    // what this test asserts. A zero-valued i128 ScVal unwraps to 0n.
+    vi.spyOn(client as any, "simulate").mockResolvedValue(
+      nativeToScVal(0, { type: "i128" })
+    );
     const result = await client.receiveStreams(ACCOUNT, TOKEN, signer);
 
     expect(result).toEqual({ received: 0n, txHash: "" });
@@ -250,7 +241,11 @@ describe("withdraw (#864)", () => {
       .spyOn(client as any, "buildAndSend")
       .mockResolvedValue("should-not-be-called");
 
-    vi.spyOn(client as any, "simulate").mockResolvedValue(0 as any);
+    // A real zero ScVal, so scValToNative yields 0n and withdraw short-circuits
+    // rather than falling into the proceed-anyway sentinel.
+    vi.spyOn(client as any, "simulate").mockResolvedValue(
+      nativeToScVal(0, { type: "i128" })
+    );
 
     const result = await client.withdraw(ACCOUNT, TOKEN, signer);
 

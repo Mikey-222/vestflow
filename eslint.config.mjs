@@ -12,6 +12,9 @@ const eslintConfig = [
       ".next/**",
       "node_modules/**",
       "public/workers/**",
+      // The API server is a standalone package with its own eslint/typescript
+      // install (type-checked rules need api/node_modules present).
+      "api/**",
     ],
   },
   {

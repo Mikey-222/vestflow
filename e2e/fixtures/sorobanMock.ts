@@ -129,6 +129,47 @@ function invokedFunctionName(envelopeXdrBase64: string): string {
   }
 }
 
+/**
+ * Length of the ScVec passed as `argIndex` to the invoked contract function.
+ *
+ * Used to count receivers in a `batch_give` envelope, whose args are
+ * [sender, receivers, amounts, token] -- so the receiver count is arg 1.
+ * Returns 0 when the envelope cannot be parsed or the arg is not a vec.
+ */
+function invokedArgVecLength(envelopeXdrBase64: string, argIndex: number): number {
+  try {
+    const tx = TransactionBuilder.fromXDR(envelopeXdrBase64, Networks.TESTNET) as Transaction;
+    const op = tx.operations[0] as unknown as { func: xdr.HostFunction };
+    const args = op.func.invokeContract().args();
+    return args[argIndex]?.vec()?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * One `given` contract event, shaped exactly like the ones VestFlow's
+ * `give`/`batch_give` publish: topics (given, sender, token), data = amount.
+ */
+function givenEventXdr(sender: string, token: string, amount: bigint): xdr.ContractEvent {
+  const v0 = new xdr.ContractEventV0({
+    topics: [
+      nativeToScVal("given", { type: "symbol" }),
+      nativeToScVal(sender, { type: "address" }),
+      nativeToScVal(token, { type: "address" }),
+    ],
+    data: nativeToScVal(amount, { type: "i128" }),
+  });
+  // ContractEventBody is a union; in this SDK version it is constructed
+  // positionally as (switch, value) rather than via an arm helper.
+  return new xdr.ContractEvent({
+    ext: new xdr.ExtensionPoint(0),
+    contractId: null,
+    type: xdr.ContractEventType.contract(),
+    body: new xdr.ContractEventBody(0, v0),
+  });
+}
+
 function successTransactionResultXdr(feeCharged: string): string {
   const opResult = xdr.OperationResult.opInner(
     xdr.OperationResultTr.invokeHostFunction(
@@ -143,7 +184,10 @@ function successTransactionResultXdr(feeCharged: string): string {
   return result.toXDR("base64");
 }
 
-function sorobanTransactionMetaXdr(returnValue: xdr.ScVal): string {
+function sorobanTransactionMetaXdr(
+  returnValue: xdr.ScVal,
+  events: xdr.ContractEvent[] = []
+): string {
   const meta = new xdr.TransactionMeta(
     3,
     new xdr.TransactionMetaV3({
@@ -153,7 +197,7 @@ function sorobanTransactionMetaXdr(returnValue: xdr.ScVal): string {
       txChangesAfter: [],
       sorobanMeta: new xdr.SorobanTransactionMeta({
         ext: new xdr.SorobanTransactionMetaExt(0),
-        events: [],
+        events,
         returnValue,
         diagnosticEvents: [],
       }),
@@ -193,10 +237,28 @@ export interface MockDripsList {
   rate: bigint;
 }
 
+/** A contract function the app actually submitted during the test. */
+export interface RecordedInvocation {
+  /** Invoked contract function name, e.g. "batch_give". */
+  functionName: string;
+  /** For `batch_give`, how many receivers the single call carried. */
+  receiverCount?: number;
+  /** How many `given` events the mocked chain reported for this call. */
+  givenEventCount: number;
+}
+
 export interface MockRpc {
   /** Moves the mocked ledger clock forward so the stream accrues `seconds` more. */
   advanceLedgerTime(seconds: number): void;
   lists: MockDripsList[];
+  /**
+   * Every contract invocation the app submitted, in order.
+   *
+   * Lets a test assert *how* the app batched its work -- e.g. that a 5-row CSV
+   * produced exactly one `batch_give` call rather than five `give` calls --
+   * which is the property that actually matters for gas and for atomicity.
+   */
+  invocations: RecordedInvocation[];
 }
 
 /**
@@ -219,6 +281,10 @@ export async function mockFreighterAndRpc(
   let ledgerTime = options.ledgerTime ?? Math.floor(Date.now() / 1000);
   let collected = 0n;
   const lists: MockDripsList[] = [];
+  const invocations: RecordedInvocation[] = [];
+  // Receiver count of the most recent batch_give, so getTransaction can report
+  // the one `given` event per receiver that the real contract would emit.
+  let lastBatchReceivers = 0;
 
   await page.addInitScript(
     ({ publicKey }) => {
@@ -315,6 +381,25 @@ export async function mockFreighterAndRpc(
             // The mock accepts signed envelopes without requiring a real signer.
           }
         }
+        const submittedFn = params?.transaction
+          ? invokedFunctionName(params.transaction)
+          : "";
+        if (submittedFn === "batch_give" && params?.transaction) {
+          lastBatchReceivers = invokedArgVecLength(params.transaction, 1);
+        }
+        // `give` publishes one `given` event; `batch_give` publishes one per
+        // receiver. Mirroring that here is what lets a test verify the batch
+        // really did fan out into 5 transfers from a single submission.
+        if (submittedFn) {
+          invocations.push({
+            functionName: submittedFn,
+            ...(submittedFn === "batch_give"
+              ? { receiverCount: lastBatchReceivers }
+              : {}),
+            givenEventCount:
+              submittedFn === "batch_give" ? lastBatchReceivers : 1,
+          });
+        }
         if (lists.length === 0) {
           lists.push({ id: "1", name: "Core Contributors", owner: MOCK_PUBLIC_KEY, token: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC", members: [], rate: 0n });
         } else if (lists[0].rate === 0n && lists[0].members.length < 3) {
@@ -349,7 +434,18 @@ export async function mockFreighterAndRpc(
           feeBump: false,
           envelopeXdr: anyEnvelopeXdr(),
           resultXdr: successTransactionResultXdr("50100"),
-          resultMetaXdr: sorobanTransactionMetaXdr(retvalFor(lastFunctionName, seq)),
+          resultMetaXdr: sorobanTransactionMetaXdr(
+            retvalFor(lastFunctionName, seq),
+            lastBatchReceivers > 0
+              ? Array.from({ length: lastBatchReceivers }, () =>
+                  givenEventXdr(
+                    MOCK_PUBLIC_KEY,
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                    10_000_000n
+                  )
+                )
+              : []
+          ),
         });
       }
       default:
@@ -362,5 +458,6 @@ export async function mockFreighterAndRpc(
       ledgerTime += seconds;
     },
     lists,
+    invocations,
   };
 }

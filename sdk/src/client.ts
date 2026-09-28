@@ -28,6 +28,7 @@ import type {
   VestingKind,
   ClaimDelegation,
   Stream,
+  StreamConfig,
   StreamsHistory,
   CollectResult,
   ReceiveStreamsResult,
@@ -42,6 +43,7 @@ import type {
   GiveHistoryPage,
   GiveHistoryOptions,
   DripsListSummary,
+  SplitsReceiver,
 } from "./types";
 import { ProfileError } from "./types";
 import { xlmToStroops } from "./utils";
@@ -74,6 +76,25 @@ const DEFAULTS = {
 // Well-known funded testnet account used as fallback source for read-only
 // simulations when no wallet is connected.
 const FALLBACK_ACCOUNT = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+
+// Shape of a Stellar account ID: a `G` plus 55 base-32 characters. This is the
+// same check the indexer applies, mirrored so a typo fails locally with a clear
+// message instead of becoming an opaque 400 from the far end.
+const STELLAR_ADDRESS = /^G[A-Z2-7]{54,55}$/;
+
+/**
+ * Throw early if `address` is not a Stellar account ID.
+ *
+ * A bad address is a caller bug, not a server fault, so it is reported as a
+ * plain `TypeError` before any request is made. Catching it separately from
+ * indexer failures means a typo and an outage are never confused for one
+ * another at a `catch` site.
+ */
+function assertStellarAddress(address: string, label: string): void {
+  if (typeof address !== "string" || !STELLAR_ADDRESS.test(address)) {
+    throw new TypeError(`Invalid Stellar address for ${label}: ${String(address)}`);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // VestflowClient
@@ -274,6 +295,85 @@ export class VestflowClient {
       ratePerSec: BigInt(String(item.ratePerSec ?? item.rate_per_sec ?? 0)),
       maxEndTime: Number(item.maxEndTime ?? item.max_end_time ?? 0),
     }));
+  }
+
+  /**
+   * Query the VestFlow indexer for the live configuration of one
+   * (sender, receiver, token) stream.
+   *
+   * Hits the indexer's `GET /streams/<sender>/<receiver>/<token>` endpoint and
+   * returns a typed {@link StreamConfig} carrying the stream's rate, start time
+   * and the sender's remaining streamable balance.
+   *
+   * Returns `null` — not a throw — when the indexer reports no such stream
+   * (HTTP 404), since "this stream does not exist" is an ordinary answer to
+   * "does this stream exist", and callers usually want to branch on it rather
+   * than handle an exception. Every other non-2xx response throws.
+   *
+   * This is a read-only indexer query; it performs no on-chain simulation and
+   * needs neither a wallet nor a funded fallback account.
+   *
+   * @param sender - Stellar address that opened the stream.
+   * @param receiver - Stellar address receiving the stream.
+   * @param token - Stellar Asset Contract address of the streamed token.
+   * @param indexerUrl - Optional indexer base URL override (defaults to the
+   *   client's configured `indexerUrl`).
+   * @returns The {@link StreamConfig}, or `null` if no active stream exists.
+   * @throws {TypeError} If any address is not a valid Stellar account ID.
+   * @throws {Error} If the indexer returns a non-2xx status other than 404, or
+   *   the request fails outright.
+   *
+   * @example
+   * ```ts
+   * const config = await client.getStreamConfig(sender, receiver, token);
+   * if (!config) return;                       // no such stream
+   * const secondsLeft = config.maxEndTime === null
+   *   ? Infinity
+   *   : config.maxEndTime - Math.floor(Date.now() / 1000);
+   * ```
+   */
+  async getStreamConfig(
+    sender: string,
+    receiver: string,
+    token: string,
+    indexerUrl = this.indexerUrl,
+  ): Promise<StreamConfig | null> {
+    // Validate before the request: a typo should not cost a round trip, and the
+    // indexer's own 400 would not say which of the three arguments was wrong.
+    assertStellarAddress(sender, "sender");
+    assertStellarAddress(receiver, "receiver");
+
+    const base = indexerUrl.replace(/\/$/, "");
+    const url =
+      `${base}/streams/${encodeURIComponent(sender)}` +
+      `/${encodeURIComponent(receiver)}` +
+      `/${encodeURIComponent(token)}` +
+      `?network=${encodeURIComponent(this.network)}`;
+
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      throw new Error(`Indexer request failed: ${res.status} ${res.statusText}`);
+    }
+
+    const body = (await res.json()) as Record<string, unknown> | null;
+    if (!body || typeof body !== "object") {
+      throw new Error("Indexer request failed: expected a stream config object");
+    }
+
+    // The indexer speaks snake_case; accept camelCase too so the SDK and the
+    // indexer can evolve independently without silently yielding zeroes.
+    const maxEndTime = body.maxEndTime ?? body.max_end_time;
+    return {
+      sender: String(body.sender ?? sender),
+      receiver: String(body.receiver ?? receiver),
+      token: String(body.token ?? token),
+      ratePerSec: BigInt(String(body.ratePerSec ?? body.rate ?? 0)),
+      startTime: Number(body.startTime ?? body.start_time ?? 0),
+      balance: BigInt(String(body.balance ?? 0)),
+      maxEndTime: maxEndTime === null || maxEndTime === undefined ? null : Number(maxEndTime),
+    };
   }
 
   /** Query sent and/or received give history for an account. */
@@ -1822,6 +1922,8 @@ export class VestflowClient {
   }
 
   subscribeToSchedule(
+    id: number,
+    callback: (schedule: ScheduleData, claimable: bigint) => void | Promise<void>,
     options: {
       intervalMs?: number;
       publicKey?: string;
@@ -1906,8 +2008,6 @@ export class VestflowClient {
       clearInterval(timerId);
     };
   }
-}
-
 
   /**
    * Configure splits receivers for an account wrapping the set_splits contract call.

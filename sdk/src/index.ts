@@ -24,6 +24,7 @@ export type {
   RevokedSchedule,
   VestflowConfig,
   Stream,
+  StreamConfig,
   StreamReceiver,
   StreamsHistory,
   CreateScheduleParams,

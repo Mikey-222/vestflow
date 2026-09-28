@@ -1514,6 +1514,56 @@ export function queryDripsStreams(params: {
   };
 }
 
+/** Default look-ahead for {@link queryExpiringStreams}, in days. */
+export const DEFAULT_EXPIRY_WINDOW_DAYS = 7;
+
+/** Largest look-ahead {@link queryExpiringStreams} will accept, in days. */
+export const MAX_EXPIRY_WINDOW_DAYS = 365;
+
+/**
+ * Issue #947 — open outgoing streams for `account` that are due to finish
+ * within `windowDays` of now.
+ *
+ * "Expiring" means `estimated_end_time` has been projected by the funder but not
+ * yet reached, so these are the streams a user would want to act on (top up,
+ * extend, or let run out). Streams with no projected end are excluded because
+ * they are open-ended and never "expire"; streams already past their end or
+ * explicitly closed are excluded because there is nothing left to do.
+ *
+ * The lower bound (`estimated_end_time > now`) matters: without it a stream
+ * that finished inside the window but has not been reaped yet would be reported
+ * as expiring when it has in fact already ended.
+ *
+ * Not keyset-paginated. This feeds a "what needs attention soon" panel, so it is
+ * ordered by how soon each stream ends and hard-capped; callers wanting full
+ * enumeration should use `queryDripsStreams`.
+ */
+export function queryExpiringStreams(params: {
+  account: string;
+  windowDays?: number;
+  limit?: number;
+  network?: NetworkName;
+}): DripsStream[] {
+  const windowDays = Math.min(
+    Math.max(params.windowDays ?? DEFAULT_EXPIRY_WINDOW_DAYS, 1),
+    MAX_EXPIRY_WINDOW_DAYS,
+  );
+  const now = Math.floor(Date.now() / 1000);
+  const horizon = now + windowDays * 86_400;
+  const rows = getDb(params.network)
+    .prepare(
+      `SELECT receiver, token, rate_per_second, estimated_end_time
+     FROM drips_streams
+     WHERE account = ? AND ended_at IS NULL
+       AND estimated_end_time IS NOT NULL
+       AND estimated_end_time > ? AND estimated_end_time <= ?
+     ORDER BY estimated_end_time ASC
+     LIMIT ?`,
+    )
+    .all(params.account, now, horizon, boundedPageSize(params.limit)) as DripsStream[];
+  return rows;
+}
+
 /**
  * Active incoming streams for a receiver — streams opened by other senders
  * where `receiver = ?`, not closed, and not past their estimated end time.
@@ -1818,6 +1868,77 @@ export function getCollectedTotal(
     )
     .get(account, token) as { total_collected_stroops: string } | undefined;
   return row?.total_collected_stroops ?? "0";
+}
+
+export interface GiveSummary {
+  total_given: string;
+  total_received: string;
+  unique_senders: number;
+  unique_receivers: number;
+  give_count: number;
+  receive_count: number;
+}
+
+/**
+ * Aggregate give activity for an address across all tokens, computed from
+ * the indexed gives table. Returns zero values when the address has no
+ * activity (never null).
+ */
+export function getGiveSummary(
+  address: string,
+  network?: NetworkName,
+): GiveSummary {
+  const db = getDb(network);
+  const givenRows = db
+    .prepare("SELECT amount_stroops AS value FROM gives WHERE sender = ?")
+    .all(address) as { value: string | null }[];
+  const receivedRows = db
+    .prepare("SELECT amount_stroops AS value FROM gives WHERE receiver = ?")
+    .all(address) as { value: string | null }[];
+
+  let totalGiven = 0n;
+  for (const row of givenRows) {
+    try {
+      totalGiven += BigInt(row.value ?? "0");
+    } catch {
+      // ignore malformed amounts rather than failing the whole summary
+    }
+  }
+
+  let totalReceived = 0n;
+  for (const row of receivedRows) {
+    try {
+      totalReceived += BigInt(row.value ?? "0");
+    } catch {
+      // ignore malformed amounts rather than failing the whole summary
+    }
+  }
+
+  const giveCount = db
+    .prepare("SELECT COUNT(*) AS count FROM gives WHERE sender = ?")
+    .get(address) as { count: number } | undefined;
+  const receiveCount = db
+    .prepare("SELECT COUNT(*) AS count FROM gives WHERE receiver = ?")
+    .get(address) as { count: number } | undefined;
+  const uniqueSenders = db
+    .prepare(
+      "SELECT COUNT(DISTINCT sender) AS count FROM gives WHERE receiver = ?",
+    )
+    .get(address) as { count: number } | undefined;
+  const uniqueReceivers = db
+    .prepare(
+      "SELECT COUNT(DISTINCT receiver) AS count FROM gives WHERE sender = ?",
+    )
+    .get(address) as { count: number } | undefined;
+
+  return {
+    total_given: totalGiven.toString(),
+    total_received: totalReceived.toString(),
+    unique_senders: uniqueSenders?.count ?? 0,
+    unique_receivers: uniqueReceivers?.count ?? 0,
+    give_count: giveCount?.count ?? 0,
+    receive_count: receiveCount?.count ?? 0,
+  };
 }
 
 /**
